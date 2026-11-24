@@ -1,0 +1,7 @@
+stage,param,passed,t_pass,max_torque,note
+1,15.0,True,275.1,17.33,
+2,20.0,True,575.1,9.67,
+3,25.0,False,,9.67,卡死：前车体已上平台，后车体卡在坡上（台阶前）
+4,30.0,False,,0.0,
+5,35.0,False,,0.0,
+6,40.0,False,,0.0,
