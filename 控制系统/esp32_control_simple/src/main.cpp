@@ -20,7 +20,8 @@ struct Side {
     rmt_item32_t pulse{};
 };
 
-// CH2 -> 左前、左后；CH4 -> 右前、右后。
+// The receiver has already mixed throttle and steering into left/right commands.
+// CH2 drives both left ESCs; CH4 drives both right ESCs without remixing.
 Side sides[] = {
     {GPIO_NUM_15, GPIO_NUM_4, GPIO_NUM_5, RMT_CHANNEL_0},
     {GPIO_NUM_16, GPIO_NUM_6, GPIO_NUM_7, RMT_CHANNEL_1},
@@ -70,7 +71,7 @@ void setup() {
         attachInterruptArg(side.input, capturePulse, &side, CHANGE);
     }
 
-    Serial.println("FW=SIMPLE-0.2 CH2->GPIO4/5 CH4->GPIO6/7");
+    Serial.println("FW=SIMPLE-0.4 SIDE-PASS CH2->GPIO4/5 CH4->GPIO6/7");
 }
 
 void loop() {
@@ -84,7 +85,7 @@ void loop() {
         side.pendingPulseUs = 0;
         portEXIT_CRITICAL(&pulseLock);
 
-        // 新的有效脉冲触发一次输出，其余时间由 RMT 保持低电平。
+        // Forward the receiver's already-mixed side command unchanged.
         if (widthUs != 0) {
             side.pulse.duration0 = widthUs;
             ESP_ERROR_CHECK(rmt_write_items(side.output, &side.pulse, 1, false));
