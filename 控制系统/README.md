@@ -10,13 +10,13 @@
 
 #### Jetson 串口联调交接
 
-[xiaogaosu_control.ino](xiaogaosu_control/xiaogaosu_control.ino) 为计科交接用单文件，沿用正式版 FW 0.4.0 的控制逻辑。文件头记录编译设置和串口输出格式。已核对源代码一致，Arduino IDE 编译与 Jetson 实机联调待验证。
+[xiaogaosu_control.ino](xiaogaosu_control/xiaogaosu_control.ino) 为计科交接用单文件，已同步更新为精简版 `FW=SIMPLE-0.4`（来源 [esp32_control_simple/src/main.cpp](esp32_control_simple/src/main.cpp)）。文件头记录编译设置、串口输出格式与调试命令；源码已核对一致，Arduino IDE 编译与 Jetson 实机联调待验证。
 
 #### 精简版对照工程
 
 | 工程 | 用途 | 状态 |
 | --- | --- | --- |
-| [esp32_control_simple](esp32_control_simple/) | 四电调对照，每侧逐个转发有效的接收机脉冲，含串口脉宽监控与定脉宽测试 | 2026-11-25 `FW=SIMPLE-0.3` 编译通过（RAM 19476 B / Flash 308121 B），待烧录和整机架空验证 |
+| [esp32_control_simple](esp32_control_simple/) | 四电调对照，CH2 左侧、CH4 右侧命令原样转发，含串口脉宽监控与定脉宽测试 | 2026-11-25 `FW=SIMPLE-0.4` 编译通过（RAM 19476 B / Flash 308185 B），待整机架空验证 |
 | [esp32_control](esp32_control/) | 正式版，含串口单路测试与调参 | 遥控驱动验收失败，无法解锁，见控制-K84 |
 
 精简版启动串口标识为 `FW=SIMPLE-0.4`，波特率 115200。接收机输出已将油门/转向混合成左右侧命令：CH2 原样转发至 GPIO4/5（左侧），CH4 原样转发至 GPIO6/7（右侧），ESP32 不做二次混控。每 300 ms 打印 `MODE`、输入 `CH2/CH4` 及输出 `OUT_L/OUT_R`。支持 `HELP`、`FIX <1100-1900>`（左右同脉宽）、`FIX L|R <1100-1900>`（单侧测试，另一侧 1500 µs）及 `STOP`；FIX 限时 5 秒，约 71 Hz。电机转向和电调反转能力仍须架空验收。
@@ -394,6 +394,7 @@ XT60用于本方案的6S输入侧，不是直接把电池接ESP32。若已买带
 - [x] 2026-11-18 模拟复现正式版缓慢回中丢失解锁状态，见控制-K85。
 - [x] 2026-11-25 更正精简版的错误二次混控，恢复左右侧通道直通并保留 COM9 配置，见控制-K86、控制-K87。
 - [x] 2026-11-25 修改精简版为双轴差速混控并通过 PlatformIO 编译，见控制-K86；未烧录，架空转向和电调反转待验证。
+- [x] 2026-11-25 重新封装 `xiaogaosu_control.ino`，同步为 `FW=SIMPLE-0.4` 并更新 Jetson 串口说明。
 
 ## 待完成
 

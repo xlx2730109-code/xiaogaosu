@@ -1,16 +1,29 @@
 /*
- * 小高速 ESP32-S3 底盘控制固件 FW 0.4.0
- * Arduino IDE 使用 Arduino-ESP32 2.0.17，板型选 ESP32S3 Dev Module。
- * Flash Mode 选 QIO，Flash Size 选 16MB，Partition Scheme 选 16MB 默认分区。
- * PSRAM 选 OPI PSRAM。使用板载 USB-UART（CP210x）时，USB CDC On Boot 选 Disabled。
+ * 小高速 ESP32-S3 底盘控制固件 FW=SIMPLE-0.4
+ * 与 控制系统/esp32_control_simple/src/main.cpp 源码同步，供 Arduino IDE 编译与 Jetson 联调。
  *
- * Jetson 通过 USB 串口以 115200 波特率读取，正常初始化后约每 200 ms 一行。
- * CH2、CH4 为遥控输入脉宽，M1 至 M4 为电调输出指令，单位均为微秒。
- * REJ 为左右输入被拒绝的脉冲累计次数。读取状态无需发送命令。
+ * Arduino IDE 配置（Arduino-ESP32 2.0.17）：
+ * - 板型：ESP32S3 Dev Module
+ * - Flash Mode：QIO
+ * - Flash Size：16MB
+ * - Partition Scheme：16MB 默认分区
+ * - PSRAM：OPI PSRAM
+ * - 使用板载 USB-UART（CP210x）时，USB CDC On Boot 选 Disabled
+ *
+ * 通道与运动说明：
+ * - 遥控接收机已完成油门与转向差速混控，ESP32 不做二次混控。
+ * - CH2（GPIO15）原样转发至左侧 GPIO4（左前）、GPIO5（左后）。
+ * - CH4（GPIO16）原样转发至右侧 GPIO6（右前）、GPIO7（右后）。
+ *
+ * Jetson 串口格式与调试命令（115200 波特率）：
+ * - 只读状态无需发送命令；上电后约每 300 ms 输出一行：
+ *   MODE=PASS|FIX | CH2=<us|NO_PULSE> CH4=<us|NO_PULSE> | OUT_L=<us> OUT_R=<us>
+ * - 支持串口命令：HELP | FIX <1100-1900> | FIX L|R <1100-1900> | STOP
+ *   （FIX 限时 5 秒，约 71 Hz，结束后自动发 1500 us 回中并恢复 PASS 模式）
  */
 
 #include <Arduino.h>
-#include <driver/gpio.h>
+#include <driver/rmt.h>
 #include <esp_timer.h>
 #include <ctype.h>
 #include <stdio.h>
@@ -18,565 +31,158 @@
 
 namespace {
 
-// 无完整有效输入 100 ms 后进入中位保护。
-constexpr int64_t kPulseTimeoutUs = 100000;
-// LEDC API 接收整数 Hz；71 Hz 时实际帧周期约为 14.085 ms。
-constexpr uint32_t kOutputFrequencyHz = 71;
-constexpr uint8_t kLedcResolutionBits = 14;
-constexpr uint32_t kLedcDutyTicks = 1U << kLedcResolutionBits;
-constexpr uint32_t kLedcDutyMax = (1U << kLedcResolutionBits) - 1;
-constexpr uint32_t kReportIntervalMs = 200;
-constexpr uint32_t kTestTimeoutMs = 5000;
-// 解锁须有明确的同向油门动作，再回中保持 2 秒。
-constexpr uint32_t kArmNeutralHoldMs = 2000;
-constexpr uint16_t kArmGestureOffsetUs = 100;
-constexpr uint8_t kArmGestureFrames = 3;
-// 限制输出脉宽变化速度，减缓电调指令突变。
-constexpr uint32_t kSlewLimitUsPerSecond = 900;
-constexpr uint32_t kMaxSlewElapsedUs = 20000;
-// 仅接收合理的普通 PPM 脉宽和周期，剔除明显毛刺。
-constexpr uint16_t kMinInputPulseUs = 800;
-constexpr uint16_t kMaxInputPulseUs = 2200;
-constexpr uint32_t kMinInputPeriodUs = 10000;
-constexpr uint32_t kMaxInputPeriodUs = 20000;
-// 使用最近 3 帧的中值，抑制单帧异常值。
-constexpr uint8_t kFilterSamples = 3;
-constexpr uint16_t kDeadbandUs = 20;
+constexpr int64_t kMinPulseUs = 800;
+constexpr int64_t kMaxPulseUs = 2200;
+constexpr int64_t kPulseTimeoutUs = 100000;  // 100 ms 无有效脉冲显示 NO_PULSE。
+constexpr uint32_t kReportIntervalMs = 300;
+constexpr uint32_t kFixPeriodMs = 14;        // FIX 模式按约 71 Hz（14 ms）发送脉宽。
+constexpr uint32_t kFixTimeoutMs = 5000;     // FIX 单次定脉宽测试限时 5 秒。
+constexpr uint16_t kFixMinUs = 1100;
+constexpr uint16_t kFixMaxUs = 1900;
+constexpr uint16_t kNeutralUs = 1500;
 
-// 输入校准；初值来自遥控器实测。
-uint16_t leftInputMinUs = 1248, leftInputNeutralUs = 1500, leftInputMaxUs = 1751;
-uint16_t rightInputMinUs = 1242, rightInputNeutralUs = 1497, rightInputMaxUs = 1749;
+struct Side {
+    Side(gpio_num_t input, gpio_num_t front, gpio_num_t rear, rmt_channel_t output)
+        : input(input), front(front), rear(rear), output(output) {}
 
-struct ChannelInput {
-    explicit ChannelInput(gpio_num_t pin) : inputPin(pin) {}
-
-    // CH2 与 CH4 的 GPIO 输入及脉冲采集状态。
-    gpio_num_t inputPin;
-    int64_t riseAtUs = 0;
-    volatile uint32_t periodUs = 0;
+    gpio_num_t input;
+    gpio_num_t front;
+    gpio_num_t rear;
+    rmt_channel_t output;
+    int64_t riseUs = 0;
     bool waitingForFall = false;
-    uint16_t pulseSamples[kFilterSamples]{};
-    uint8_t sampleCount = 0;
-    uint8_t nextSample = 0;
+    uint16_t pendingPulseUs = 0;
+    uint16_t lastWidthUs = 0;
     int64_t lastValidAtUs = 0;
-    uint32_t rejectedPulseCount = 0;
+    uint16_t lastOutUs = 0;
+    rmt_item32_t pulse{};
 };
 
-struct InputSnapshot {
-    // 主循环读取的一份稳定通道采样。
-    uint16_t pulseUs = 0;
-    uint32_t periodUs = 0;
-    int64_t lastValidAtUs = 0;
-    uint32_t rejectedPulseCount = 0;
-    bool valid = false;
+// The receiver has already mixed throttle and steering into left/right commands.
+// CH2 drives both left ESCs; CH4 drives both right ESCs without remixing.
+Side sides[] = {
+    {GPIO_NUM_15, GPIO_NUM_4, GPIO_NUM_5, RMT_CHANNEL_0},
+    {GPIO_NUM_16, GPIO_NUM_6, GPIO_NUM_7, RMT_CHANNEL_1},
 };
+portMUX_TYPE pulseLock = portMUX_INITIALIZER_UNLOCKED;
 
-struct MotorOutput {
-    MotorOutput(uint8_t outputPin,
-                uint8_t outputChannel,
-                uint16_t stopPulseUs,
-                uint16_t minimumPulseUs,
-                uint16_t maximumPulseUs,
-                bool reverseDirection,
-                uint16_t initialPulseUs)
-        : pin(outputPin),
-          ledcChannel(outputChannel),
-          escStopUs(stopPulseUs),
-          minUs(minimumPulseUs),
-          maxUs(maximumPulseUs),
-          invert(reverseDirection),
-          currentUs(initialPulseUs) {}
-
-    // 一个电调的信号引脚、LEDC 通道及当前输出脉宽。
-    uint8_t pin;
-    uint8_t ledcChannel;
-    uint16_t escStopUs;
-    uint16_t minUs;
-    uint16_t maxUs;
-    bool invert;
-    uint16_t currentUs;
-    uint32_t frequencyHz = 0;
-    bool initialized = false;
-};
-
-ChannelInput leftInput{GPIO_NUM_15};
-ChannelInput rightInput{GPIO_NUM_16};
-portMUX_TYPE inputLock = portMUX_INITIALIZER_UNLOCKED;
-
-// CH2 直通左侧两台电调，CH4 直通右侧两台电调，不再做混控。
-MotorOutput motors[] = {
-    {4, 0, 1500, 1248, 1751, false, 1500},
-    {5, 1, 1500, 1248, 1751, false, 1500},
-    {6, 2, 1497, 1242, 1749, false, 1497},
-    {7, 3, 1497, 1242, 1749, false, 1497},
-};
-
-bool armMovementSeen = false;
-bool armed = false;
-uint8_t armGestureFrameCount = 0;
-uint32_t neutralSinceMs = 0;
-uint32_t lastControlAtMs = 0;
+bool fixActive = false;
+uint16_t fixTargetUs[2] = {kNeutralUs, kNeutralUs};
+uint32_t fixStartedAtMs = 0;
+uint32_t lastFixSentAtMs = 0;
 uint32_t lastReportAtMs = 0;
-bool outputsReady = false;
-bool inputsReady = false;
-int8_t testMotorIndex = -1;
-uint16_t testPulseUs = 0;
-uint32_t testStartedAtMs = 0;
-char commandBuffer[80]{};
+char commandBuffer[64]{};
 uint8_t commandLength = 0;
-int64_t lastArmPairLeftAtUs = 0;
-int64_t lastArmPairRightAtUs = 0;
 
-void writeAllStop();
-void writePulse(MotorOutput &motor, uint16_t pulseUs);
-void disableOutputs();
-void printStatus(const InputSnapshot &left,
-                 const InputSnapshot &right,
-                 uint32_t nowMs,
-                 bool force);
-
-void stopAndLock() {
-    armed = false;
-    armMovementSeen = false;
-    armGestureFrameCount = 0;
-    neutralSinceMs = 0;
-    testMotorIndex = -1;
-    lastControlAtMs = millis();
-    writeAllStop();
-}
-
-void handleCommand(char *line, const InputSnapshot &left, const InputSnapshot &right, uint32_t nowMs) {
-    char command[12]{};
-    int motorNumber = 0;
-    long pulseUs = 0;
-    char parameter[12]{};
-    if (sscanf(line, "%11s", command) != 1) return;
-    for (char *p = command; *p; ++p) *p = static_cast<char>(toupper(*p));
-
-    if (strcmp(command, "HELP") == 0) {
-        Serial.println("STATUS | STOP | TEST <1-4> <us> | SET <1-4> STOP|MIN|MAX|INV <value>");
-        return;
-    }
-    if (strcmp(command, "STATUS") == 0) {
-        printStatus(left, right, nowMs, true);
-        for (uint8_t i = 0; i < 4; ++i) {
-            const auto &motor = motors[i];
-            Serial.printf("M%u STOP=%u MIN=%u MAX=%u INV=%u\n",
-                          i + 1, motor.escStopUs, motor.minUs, motor.maxUs, motor.invert);
-        }
-        return;
-    }
-    if (strcmp(command, "STOP") == 0) {
-        stopAndLock();
-        Serial.println("LOCKED; outputs at configured stop pulses");
-        return;
-    }
-    if (strcmp(command, "TEST") == 0) {
-        if (sscanf(line, "%*s %d %ld", &motorNumber, &pulseUs) != 2 ||
-            armed || testMotorIndex >= 0 || !left.valid || !right.valid ||
-            motorNumber < 1 || motorNumber > 4) {
-            Serial.println("TEST requires LOCKED, valid inputs, motor 1-4 and pulse_us");
-            return;
-        }
-        MotorOutput &motor = motors[motorNumber - 1];
-        if (pulseUs < motor.minUs || pulseUs > motor.maxUs) {
-            Serial.printf("M%d range is %u-%u us\n", motorNumber, motor.minUs, motor.maxUs);
-            return;
-        }
-        testMotorIndex = static_cast<int8_t>(motorNumber - 1);
-        testPulseUs = static_cast<uint16_t>(pulseUs);
-        testStartedAtMs = nowMs;
-        lastControlAtMs = nowMs;
-        writeAllStop();
-        Serial.printf("M%d test for 5 s; wheels must be raised\n", motorNumber);
-        return;
-    }
-    if (strcmp(command, "SET") != 0 || armed || testMotorIndex >= 0 ||
-        sscanf(line, "%*s %d %11s %ld", &motorNumber, parameter, &pulseUs) != 3 ||
-        motorNumber < 1 || motorNumber > 4) {
-        Serial.println("SET requires LOCKED: SET <1-4> STOP|MIN|MAX|INV <value>");
-        return;
-    }
-    for (char *p = parameter; *p; ++p) *p = static_cast<char>(toupper(*p));
-    MotorOutput &motor = motors[motorNumber - 1];
-    if (strcmp(parameter, "INV") == 0 && (pulseUs == 0 || pulseUs == 1)) {
-        motor.invert = pulseUs == 1;
-    } else if (strcmp(parameter, "STOP") == 0 && pulseUs >= motor.minUs && pulseUs <= motor.maxUs) {
-        motor.escStopUs = static_cast<uint16_t>(pulseUs);
-    } else if (strcmp(parameter, "MIN") == 0 && pulseUs >= kMinInputPulseUs &&
-               pulseUs < motor.escStopUs && pulseUs < motor.maxUs) {
-        motor.minUs = static_cast<uint16_t>(pulseUs);
-    } else if (strcmp(parameter, "MAX") == 0 && pulseUs <= kMaxInputPulseUs &&
-               pulseUs > motor.escStopUs && pulseUs > motor.minUs) {
-        motor.maxUs = static_cast<uint16_t>(pulseUs);
-    } else {
-        Serial.println("SET rejected: value is outside the valid STOP/MIN/MAX/INV order");
-        return;
-    }
-    writeAllStop();
-    Serial.println("Updated in RAM; STATUS shows current settings");
-}
-
-// 双边沿中断测量接收机 PWM 的高电平脉宽和帧周期。
-void IRAM_ATTR captureEdge(void *argument) {
-    auto &channel = *static_cast<ChannelInput *>(argument);
+void IRAM_ATTR capturePulse(void *argument) {
+    auto &side = *static_cast<Side *>(argument);
     const int64_t nowUs = esp_timer_get_time();
-
-    if (gpio_get_level(channel.inputPin)) {
-        // 上升沿开始新脉冲，并计算与上一帧的间隔。
-        const int64_t periodUs = nowUs - channel.riseAtUs;
-        portENTER_CRITICAL_ISR(&inputLock);
-        channel.periodUs = channel.riseAtUs > 0 ? static_cast<uint32_t>(periodUs) : 0;
-        portEXIT_CRITICAL_ISR(&inputLock);
-        channel.riseAtUs = nowUs;
-        channel.waitingForFall = true;
+    if (gpio_get_level(side.input)) {
+        side.riseUs = nowUs;
+        side.waitingForFall = true;
+        return;
+    }
+    if (!side.waitingForFall) {
         return;
     }
 
-    if (!channel.waitingForFall) {
-        return;
-    }
-    // 下降沿结束高电平；只把脉宽、周期均在有效范围内的帧存入滤波器。
-    channel.waitingForFall = false;
-    const int64_t pulseUs = nowUs - channel.riseAtUs;
-    if (pulseUs < kMinInputPulseUs || pulseUs > kMaxInputPulseUs ||
-        channel.periodUs < kMinInputPeriodUs || channel.periodUs > kMaxInputPeriodUs) {
-        portENTER_CRITICAL_ISR(&inputLock);
-        ++channel.rejectedPulseCount;
-        portEXIT_CRITICAL_ISR(&inputLock);
+    side.waitingForFall = false;
+    const int64_t widthUs = nowUs - side.riseUs;
+    if (widthUs < kMinPulseUs || widthUs > kMaxPulseUs) {
         return;
     }
 
-    portENTER_CRITICAL_ISR(&inputLock);
-    channel.pulseSamples[channel.nextSample] = static_cast<uint16_t>(pulseUs);
-    channel.nextSample = (channel.nextSample + 1) % kFilterSamples;
-    if (channel.sampleCount < kFilterSamples) {
-        ++channel.sampleCount;
-    }
-    channel.lastValidAtUs = nowUs;
-    portEXIT_CRITICAL_ISR(&inputLock);
+    portENTER_CRITICAL_ISR(&pulseLock);
+    side.pendingPulseUs = static_cast<uint16_t>(widthUs);
+    side.lastWidthUs = static_cast<uint16_t>(widthUs);
+    side.lastValidAtUs = nowUs;
+    portEXIT_CRITICAL_ISR(&pulseLock);
 }
 
-// 对最近几帧排序后取中值，避免单个异常脉冲改变电机指令。
-uint16_t medianPulse(const uint16_t *samples, uint8_t count) {
-    uint16_t sorted[kFilterSamples];
-    for (uint8_t i = 0; i < count; ++i) {
-        sorted[i] = samples[i];
-    }
-    for (uint8_t i = 1; i < count; ++i) {
-        const uint16_t value = sorted[i];
-        int8_t j = static_cast<int8_t>(i) - 1;
-        while (j >= 0 && sorted[j] > value) {
-            sorted[j + 1] = sorted[j];
-            --j;
-        }
-        sorted[j + 1] = value;
-    }
-    return sorted[count / 2];
+void sendSidePulse(Side &side, uint16_t widthUs) {
+    ESP_ERROR_CHECK(rmt_wait_tx_done(side.output, portMAX_DELAY));
+    side.pulse.duration0 = widthUs;
+    ESP_ERROR_CHECK(rmt_write_items(side.output, &side.pulse, 1, false));
+    side.lastOutUs = widthUs;
 }
 
-InputSnapshot readInput(ChannelInput &channel, int64_t nowUs) {
-    uint16_t samples[kFilterSamples];
-    uint8_t count;
-    uint32_t periodUs;
-    int64_t lastValidAtUs;
-    uint32_t rejectedPulseCount;
-
-    // 中断可能同时更新采样环形缓冲区，复制时使用临界区。
-    portENTER_CRITICAL(&inputLock);
-    count = channel.sampleCount;
-    periodUs = channel.periodUs;
-    lastValidAtUs = channel.lastValidAtUs;
-    rejectedPulseCount = channel.rejectedPulseCount;
-    for (uint8_t i = 0; i < count; ++i) {
-        samples[i] = channel.pulseSamples[i];
-    }
-    portEXIT_CRITICAL(&inputLock);
-
-    InputSnapshot result;
-    result.periodUs = periodUs;
-    result.lastValidAtUs = lastValidAtUs;
-    result.rejectedPulseCount = rejectedPulseCount;
-    result.valid = count == kFilterSamples &&
-                   lastValidAtUs > 0 &&
-                   nowUs - lastValidAtUs < kPulseTimeoutUs &&
-                   periodUs >= kMinInputPeriodUs &&
-                   periodUs <= kMaxInputPeriodUs;
-    if (result.valid) {
-        result.pulseUs = medianPulse(samples, count);
-    }
-    return result;
+void stopFixAndNeutral() {
+    fixActive = false;
+    sendSidePulse(sides[0], kNeutralUs);
+    sendSidePulse(sides[1], kNeutralUs);
+    // 丢弃测试期间累积的待转发脉冲，恢复透传。
+    portENTER_CRITICAL(&pulseLock);
+    sides[0].pendingPulseUs = 0;
+    sides[1].pendingPulseUs = 0;
+    portEXIT_CRITICAL(&pulseLock);
 }
 
-uint16_t motorTargetUs(uint16_t inputPulseUs,
-                       uint16_t inputMinUs,
-                       uint16_t inputNeutralUs,
-                       uint16_t inputMaxUs,
-                       const MotorOutput &motor) {
-    const int32_t inputDeltaUs = static_cast<int32_t>(inputPulseUs) - inputNeutralUs;
-    if (abs(inputDeltaUs) <= kDeadbandUs) {
-        return motor.escStopUs;
+void handleCommand(char *line, uint32_t nowMs) {
+    char cmd[12]{};
+    char arg1[12]{};
+    long val = 0;
+    if (sscanf(line, "%11s", cmd) != 1) {
+        return;
+    }
+    for (char *p = cmd; *p; ++p) {
+        *p = static_cast<char>(toupper(*p));
     }
 
-    const bool inputAboveNeutral = inputDeltaUs > 0;
-    const bool outputAboveStop = motor.invert ? !inputAboveNeutral : inputAboveNeutral;
-    const uint32_t inputSpanUs = inputAboveNeutral
-        ? inputMaxUs - inputNeutralUs
-        : inputNeutralUs - inputMinUs;
-    const uint32_t outputSpanUs = outputAboveStop
-        ? motor.maxUs - motor.escStopUs
-        : motor.escStopUs - motor.minUs;
-    if (inputSpanUs == 0) {
-        return motor.escStopUs;
+    if (strcmp(cmd, "HELP") == 0) {
+        Serial.println("CMD: HELP | FIX <1100-1900> | FIX L|R <1100-1900> | STOP");
+        return;
     }
-
-    const uint32_t mappedDeltaUs =
-        (static_cast<uint32_t>(abs(inputDeltaUs)) * outputSpanUs + inputSpanUs / 2) / inputSpanUs;
-    const int32_t targetUs = static_cast<int32_t>(motor.escStopUs) +
-                             (outputAboveStop ? mappedDeltaUs : -static_cast<int32_t>(mappedDeltaUs));
-    return constrain(targetUs, static_cast<int32_t>(motor.minUs), static_cast<int32_t>(motor.maxUs));
-}
-
-// 按经过的时间逐步靠近目标脉宽，避免输出瞬间跳变。
-uint16_t slewToward(uint16_t currentUs, uint16_t targetUs, uint32_t elapsedUs) {
-    elapsedUs = min(elapsedUs, kMaxSlewElapsedUs);
-    const uint32_t maxStepUs = max<uint32_t>(
-        1, (static_cast<uint64_t>(kSlewLimitUsPerSecond) * elapsedUs) / 1000000);
-    if (targetUs > currentUs) {
-        return static_cast<uint16_t>(min<uint32_t>(targetUs, currentUs + maxStepUs));
+    if (strcmp(cmd, "STOP") == 0) {
+        stopFixAndNeutral();
+        Serial.println("STOPPED: sent 1500 us and returned to PASS mode");
+        return;
     }
-    return static_cast<uint16_t>(max<int32_t>(targetUs, currentUs - min<uint32_t>(currentUs, maxStepUs)));
-}
-
-void writePulse(MotorOutput &motor, uint16_t pulseUs) {
-    motor.currentUs = pulseUs;
-    // 用每个 LEDC 定时器的实际频率换算脉宽，避免整数频率取整造成中位偏移。
-    uint32_t duty = static_cast<uint32_t>(
-        (static_cast<uint64_t>(pulseUs) * motor.frequencyHz * kLedcDutyTicks + 500000U) / 1000000U);
-    duty = min(duty, kLedcDutyMax);
-    ledcWrite(motor.ledcChannel, min(duty, kLedcDutyMax));
-}
-
-void writeAllStop() {
-    // 未解锁或输入无效时，四路输出各自可配置的电调停止脉宽。
-    for (auto &motor : motors) {
-        if (motor.initialized) {
-            writePulse(motor, motor.escStopUs);
-        }
-    }
-}
-
-bool initializeOutputs() {
-    for (auto &motor : motors) {
-        // ESP32-S3 LEDC 最高 14 位；输出帧频率按整数 Hz 设置。
-        motor.frequencyHz = ledcSetup(motor.ledcChannel, kOutputFrequencyHz, kLedcResolutionBits);
-        if (motor.frequencyHz == 0) {
-            Serial.printf("LEDC setup failed on GPIO%u\n", motor.pin);
-            for (auto &configuredMotor : motors) {
-                if (configuredMotor.initialized) {
-                    ledcDetachPin(configuredMotor.pin);
-                    configuredMotor.initialized = false;
-                }
-                pinMode(configuredMotor.pin, INPUT_PULLDOWN);
-            }
-            return false;
-        }
-        ledcAttachPin(motor.pin, motor.ledcChannel);
-        motor.initialized = true;
-    }
-    writeAllStop();
-    return true;
-}
-
-void disableOutputs() {
-    for (auto &motor : motors) {
-        if (motor.initialized) {
-            ledcDetachPin(motor.pin);
-            motor.initialized = false;
-        }
-        pinMode(motor.pin, INPUT_PULLDOWN);
-    }
-}
-
-bool initializeInputs() {
-    gpio_config_t inputConfig{};
-    inputConfig.pin_bit_mask = (1ULL << leftInput.inputPin) | (1ULL << rightInput.inputPin);
-    inputConfig.mode = GPIO_MODE_INPUT;
-    inputConfig.pull_up_en = GPIO_PULLUP_DISABLE;
-    inputConfig.pull_down_en = GPIO_PULLDOWN_ENABLE;
-    inputConfig.intr_type = GPIO_INTR_ANYEDGE;
-    if (gpio_config(&inputConfig) != ESP_OK) {
-        Serial.println("Receiver GPIO configuration failed");
-        return false;
-    }
-
-    const esp_err_t serviceResult = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
-    if (serviceResult != ESP_OK && serviceResult != ESP_ERR_INVALID_STATE) {
-        Serial.printf("GPIO ISR service failed: %d\n", serviceResult);
-        return false;
-    }
-    if (gpio_isr_handler_add(leftInput.inputPin, captureEdge, &leftInput) != ESP_OK) {
-        Serial.println("CH2 interrupt registration failed");
-        return false;
-    }
-    if (gpio_isr_handler_add(rightInput.inputPin, captureEdge, &rightInput) != ESP_OK) {
-        gpio_isr_handler_remove(leftInput.inputPin);
-        Serial.println("CH4 interrupt registration failed");
-        return false;
-    }
-    return true;
-}
-
-void updateArmState(const InputSnapshot &left, const InputSnapshot &right, uint32_t nowMs) {
-    if (testMotorIndex >= 0) {
-        armed = false;
+    if (strcmp(cmd, "FIX") != 0) {
+        Serial.println("Unknown cmd; type HELP");
         return;
     }
 
-    if (!left.valid || !right.valid) {
-        // 任一路失去有效帧，锁定输出并要求重新执行解锁动作。
-        armed = false;
-        armMovementSeen = false;
-        armGestureFrameCount = 0;
-        neutralSinceMs = 0;
-        lastArmPairLeftAtUs = 0;
-        lastArmPairRightAtUs = 0;
-        return;
-    }
-
-    const bool bothNeutral =
-        abs(static_cast<int32_t>(left.pulseUs) - leftInputNeutralUs) <= kDeadbandUs &&
-        abs(static_cast<int32_t>(right.pulseUs) - rightInputNeutralUs) <= kDeadbandUs;
-    const bool newInputPair =
-        left.lastValidAtUs > lastArmPairLeftAtUs &&
-        right.lastValidAtUs > lastArmPairRightAtUs;
-
-    if (newInputPair) {
-        lastArmPairLeftAtUs = left.lastValidAtUs;
-        lastArmPairRightAtUs = right.lastValidAtUs;
-    }
-
-    if (newInputPair && !armed) {
-        if (!armed && !bothNeutral) {
-            const int32_t leftDeltaUs = static_cast<int32_t>(left.pulseUs) - leftInputNeutralUs;
-            const int32_t rightDeltaUs = static_cast<int32_t>(right.pulseUs) - rightInputNeutralUs;
-            const bool deliberateThrottle =
-                (leftDeltaUs >= kArmGestureOffsetUs && rightDeltaUs >= kArmGestureOffsetUs) ||
-                (leftDeltaUs <= -kArmGestureOffsetUs && rightDeltaUs <= -kArmGestureOffsetUs);
-            armGestureFrameCount = deliberateThrottle
-                ? min<uint8_t>(kArmGestureFrames, armGestureFrameCount + 1)
-                : 0;
-            armMovementSeen = armGestureFrameCount >= kArmGestureFrames;
-            neutralSinceMs = 0;
-        }
-    }
-
-    if (armed) {
-        return;
-    }
-
-    if (!bothNeutral) {
-        neutralSinceMs = 0;
-        return;
-    }
-
-    if (armMovementSeen) {
-        // 只认前后油门同向动作，左右转向动作不能单独解锁。
-        if (neutralSinceMs == 0) {
-            neutralSinceMs = nowMs;
-        } else if (nowMs - neutralSinceMs >= kArmNeutralHoldMs) {
-            armed = true;
-            armGestureFrameCount = 0;
-            lastControlAtMs = nowMs;
-        }
-    }
-}
-
-void updateOutputs(const InputSnapshot &left, const InputSnapshot &right, uint32_t nowMs) {
-    if (testMotorIndex >= 0) {
-        if (!left.valid || !right.valid || nowMs - testStartedAtMs >= kTestTimeoutMs) {
-            const int8_t finishedMotor = testMotorIndex;
-            stopAndLock();
-            Serial.printf("TEST M%d ended; outputs at configured stop pulses\n", finishedMotor + 1);
+    if (sscanf(line, "%*s %ld", &val) == 1) {
+        if (val < kFixMinUs || val > kFixMaxUs) {
+            Serial.printf("FIX pulse must be %u-%u us\n", kFixMinUs, kFixMaxUs);
             return;
         }
-        for (uint8_t i = 0; i < 4; ++i) {
-            if (i != static_cast<uint8_t>(testMotorIndex)) {
-                writePulse(motors[i], motors[i].escStopUs);
-            }
+        fixTargetUs[0] = static_cast<uint16_t>(val);
+        fixTargetUs[1] = static_cast<uint16_t>(val);
+        fixActive = true;
+        fixStartedAtMs = nowMs;
+        lastFixSentAtMs = 0;
+        Serial.printf("FIX BOTH=%ld us for 5 s\n", val);
+        return;
+    }
+
+    if (sscanf(line, "%*s %11s %ld", arg1, &val) == 2 && val >= kFixMinUs && val <= kFixMaxUs) {
+        const char sideChar = static_cast<char>(toupper(arg1[0]));
+        if (arg1[1] == '\0' && (sideChar == 'L' || sideChar == 'R')) {
+            fixTargetUs[0] = (sideChar == 'L') ? static_cast<uint16_t>(val) : kNeutralUs;
+            fixTargetUs[1] = (sideChar == 'R') ? static_cast<uint16_t>(val) : kNeutralUs;
+            fixActive = true;
+            fixStartedAtMs = nowMs;
+            lastFixSentAtMs = 0;
+            Serial.printf("FIX %c=%ld us (other=1500 us) for 5 s\n", sideChar, val);
+            return;
         }
-        MotorOutput &motor = motors[testMotorIndex];
-        const uint32_t elapsedMs = nowMs - lastControlAtMs;
-        lastControlAtMs = nowMs;
-        const uint32_t elapsedUs = min(elapsedMs * 1000U, kMaxSlewElapsedUs);
-        writePulse(motor, slewToward(motor.currentUs, testPulseUs, elapsedUs));
-        return;
     }
 
-    if (!left.valid || !right.valid || !armed) {
-        writeAllStop();
-        lastControlAtMs = nowMs;
-        return;
-    }
-
-    const bool bothNeutral =
-        abs(static_cast<int32_t>(left.pulseUs) - leftInputNeutralUs) <= kDeadbandUs &&
-        abs(static_cast<int32_t>(right.pulseUs) - rightInputNeutralUs) <= kDeadbandUs;
-    if (bothNeutral) {
-        writeAllStop();
-        lastControlAtMs = nowMs;
-        return;
-    }
-
-    const uint32_t elapsedMs = lastControlAtMs == 0 ? 0 : nowMs - lastControlAtMs;
-    const uint32_t elapsedUs = min(elapsedMs * 1000U, kMaxSlewElapsedUs);
-    lastControlAtMs = nowMs;
-
-    for (auto &motor : motors) {
-        const bool leftSide = motor.pin == 4 || motor.pin == 5;
-        const uint16_t inputPulseUs = leftSide ? left.pulseUs : right.pulseUs;
-        const uint16_t inputNeutralUs = leftSide ? leftInputNeutralUs : rightInputNeutralUs;
-        const uint16_t inputMinUs = leftSide ? leftInputMinUs : rightInputMinUs;
-        const uint16_t inputMaxUs = leftSide ? leftInputMaxUs : rightInputMaxUs;
-        const uint16_t targetUs =
-            motorTargetUs(inputPulseUs, inputMinUs, inputNeutralUs, inputMaxUs, motor);
-        writePulse(motor, slewToward(motor.currentUs, targetUs, elapsedUs));
-    }
+    Serial.println("Usage: FIX <1100-1900> | FIX L|R <1100-1900>");
 }
 
-void printStatus(const InputSnapshot &left, const InputSnapshot &right, uint32_t nowMs, bool force) {
-    if (!force && nowMs - lastReportAtMs < kReportIntervalMs) {
-        return;
-    }
-    lastReportAtMs = nowMs;
-    Serial.printf(
-        "%s | CH2=%s%u us CH4=%s%u us | M1=%u M2=%u M3=%u M4=%u us | REJ=%lu/%lu\n",
-        testMotorIndex >= 0 ? "TEST" : (armed ? "ARMED" : "LOCKED"),
-        left.valid ? "" : "NO_PULSE ",
-        left.valid ? left.pulseUs : 0,
-        right.valid ? "" : "NO_PULSE ",
-        right.valid ? right.pulseUs : 0,
-        motors[0].currentUs,
-        motors[1].currentUs,
-        motors[2].currentUs,
-        motors[3].currentUs,
-        static_cast<unsigned long>(left.rejectedPulseCount),
-        static_cast<unsigned long>(right.rejectedPulseCount));
-}
-
-void processSerialCommands(const InputSnapshot &left,
-                           const InputSnapshot &right,
-                           uint32_t nowMs) {
+void processSerialCommands(uint32_t nowMs) {
     while (Serial.available() > 0) {
-        const char value = static_cast<char>(Serial.read());
-        if (value == '\r' || value == '\n') {
+        const char c = static_cast<char>(Serial.read());
+        if (c == '\r' || c == '\n') {
             if (commandLength > 0) {
                 commandBuffer[commandLength] = '\0';
-                handleCommand(commandBuffer, left, right, nowMs);
+                handleCommand(commandBuffer, nowMs);
                 commandLength = 0;
             }
         } else if (commandLength < sizeof(commandBuffer) - 1) {
-            commandBuffer[commandLength++] = value;
+            commandBuffer[commandLength++] = c;
         } else {
             commandLength = 0;
             Serial.println("Command too long");
@@ -584,53 +190,100 @@ void processSerialCommands(const InputSnapshot &left,
     }
 }
 
-void printSetupFault(uint32_t nowMs) {
-    if (nowMs - lastReportAtMs < 1000) {
+void printStatus(uint32_t nowMs, int64_t nowUs) {
+    if (nowMs - lastReportAtMs < kReportIntervalMs) {
         return;
     }
     lastReportAtMs = nowMs;
-    Serial.printf("SETUP_FAULT LEDC=%s GPIO_ISR=%s\n",
-                  outputsReady ? "OK" : "FAILED",
-                  inputsReady ? "OK" : "FAILED");
+
+    uint16_t ch2Width = 0;
+    uint16_t ch4Width = 0;
+    int64_t ch2At = 0;
+    int64_t ch4At = 0;
+
+    portENTER_CRITICAL(&pulseLock);
+    ch2Width = sides[0].lastWidthUs;
+    ch2At = sides[0].lastValidAtUs;
+    ch4Width = sides[1].lastWidthUs;
+    ch4At = sides[1].lastValidAtUs;
+    portEXIT_CRITICAL(&pulseLock);
+
+    const bool ch2Valid = ch2At > 0 && (nowUs - ch2At) < kPulseTimeoutUs;
+    const bool ch4Valid = ch4At > 0 && (nowUs - ch4At) < kPulseTimeoutUs;
+
+    Serial.printf("MODE=%s | CH2=", fixActive ? "FIX" : "PASS");
+    if (ch2Valid) {
+        Serial.printf("%u", ch2Width);
+    } else {
+        Serial.print("NO_PULSE");
+    }
+    Serial.print(" CH4=");
+    if (ch4Valid) {
+        Serial.printf("%u", ch4Width);
+    } else {
+        Serial.print("NO_PULSE");
+    }
+    Serial.printf(" | OUT_L=%u OUT_R=%u\n", sides[0].lastOutUs, sides[1].lastOutUs);
 }
 
 }  // namespace
 
 void setup() {
     Serial.begin(115200);
-    enableLoopWDT();
-    outputsReady = initializeOutputs();
-    inputsReady = initializeInputs();
-    const uint32_t actualFrequencyHz = outputsReady ? motors[0].frequencyHz : 0;
-    const uint32_t actualPeriodUs = actualFrequencyHz > 0 ? 1000000U / actualFrequencyHz : 0;
-    Serial.printf("FW=0.4.0 PWM=%lu Hz period=%lu us LEDC=%u-bit\n",
-                  static_cast<unsigned long>(actualFrequencyHz),
-                  static_cast<unsigned long>(actualPeriodUs),
-                  kLedcResolutionBits);
-    Serial.println("CH2=left CH4=right; move both in one direction, then center for 2 s to arm.");
+
+    for (auto &side : sides) {
+        rmt_config_t config = RMT_DEFAULT_CONFIG_TX(side.front, side.output);
+        config.clk_div = 80;  // ESP32-S3 默认 80 MHz APB 时钟，分频后每 tick 为 1 µs。
+        ESP_ERROR_CHECK(rmt_config(&config));
+        // 同一个 RMT 硬件信号接到同侧两只电调，两个引脚同步输出。
+        ESP_ERROR_CHECK(rmt_set_gpio(side.output, RMT_MODE_TX, side.rear, false));
+        ESP_ERROR_CHECK(rmt_driver_install(side.output, 0, 0));
+
+        side.pulse.level0 = 1;
+        side.pulse.level1 = 0;
+        side.pulse.duration1 = 1;  // 脉冲结束后由 RMT 保持低电平。
+        pinMode(side.input, INPUT_PULLDOWN);
+        attachInterruptArg(side.input, capturePulse, &side, CHANGE);
+    }
+
+    Serial.println("FW=SIMPLE-0.4 SIDE-PASS CH2->GPIO4/5 CH4->GPIO6/7 | cmd: HELP / FIX <us> / FIX L|R <us> / STOP");
 }
 
 void loop() {
-    const int64_t nowUs = esp_timer_get_time();
     const uint32_t nowMs = millis();
-    if (!outputsReady || !inputsReady) {
-        if (outputsReady) {
-            writeAllStop();
+    const int64_t nowUs = esp_timer_get_time();
+
+    processSerialCommands(nowMs);
+
+    if (fixActive) {
+        if (nowMs - fixStartedAtMs >= kFixTimeoutMs) {
+            stopFixAndNeutral();
+            Serial.println("FIX ended; returned to PASS mode");
+        } else if (lastFixSentAtMs == 0 || nowMs - lastFixSentAtMs >= kFixPeriodMs) {
+            lastFixSentAtMs = nowMs;
+            sendSidePulse(sides[0], fixTargetUs[0]);
+            sendSidePulse(sides[1], fixTargetUs[1]);
         }
-        printSetupFault(nowMs);
-        feedLoopWDT();
-        delay(20);
-        return;
+    } else {
+        for (auto &side : sides) {
+            if (rmt_wait_tx_done(side.output, 0) != ESP_OK) {
+                continue;
+            }
+
+            portENTER_CRITICAL(&pulseLock);
+            const uint16_t widthUs = side.pendingPulseUs;
+            side.pendingPulseUs = 0;
+            portEXIT_CRITICAL(&pulseLock);
+
+            // 新的有效脉冲触发一次输出，其余时间由 RMT 保持低电平。
+            if (widthUs != 0) {
+                side.pulse.duration0 = widthUs;
+                ESP_ERROR_CHECK(rmt_write_items(side.output, &side.pulse, 1, false));
+                side.lastOutUs = widthUs;
+            }
+        }
     }
 
-    const InputSnapshot left = readInput(leftInput, nowUs);
-    const InputSnapshot right = readInput(rightInput, nowUs);
-
-    processSerialCommands(left, right, nowMs);
-    updateArmState(left, right, nowMs);
-    updateOutputs(left, right, nowMs);
-    printStatus(left, right, nowMs, false);
-
-    delay(5);
-    feedLoopWDT();
+    printStatus(nowMs, nowUs);
+    delay(1);
 }
