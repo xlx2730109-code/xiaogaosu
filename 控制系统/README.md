@@ -8,6 +8,10 @@
 
 ### A. 软件、固件使用
 
+#### Jetson 串口联调交接
+
+[xiaogaosu_control.ino](xiaogaosu_control/xiaogaosu_control.ino) 为计科交接用单文件，沿用正式版 FW 0.4.0 的控制逻辑。文件头记录编译设置和串口输出格式。已核对源代码一致，Arduino IDE 编译与 Jetson 实机联调待验证。
+
 #### 精简版对照工程
 
 | 工程 | 用途 | 状态 |
